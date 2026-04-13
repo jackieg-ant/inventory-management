@@ -1,7 +1,10 @@
+from datetime import date, timedelta
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+import mock_data
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -89,6 +92,9 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
+    current_stock: int
+    lead_time_days: int
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +125,45 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+
+class RestockRecommendation(BaseModel):
+    sku: str
+    item_name: str
+    current_stock: int
+    forecasted_demand: int
+    shortage: int
+    unit_cost: float
+    recommended_qty: int
+    line_cost: float
+    lead_time_days: int
+    trend: str
+    selected: bool
+
+
+class RestockOrderItem(BaseModel):
+    sku: str
+    item_name: str
+    quantity: int
+    unit_cost: float
+    line_cost: float
+    lead_time_days: int
+
+
+class CreateRestockOrderRequest(BaseModel):
+    budget: float
+    items: List[RestockOrderItem]
+
+
+class RestockOrder(BaseModel):
+    id: str
+    submitted_at: str
+    budget: float
+    total_cost: float
+    items: List[RestockOrderItem]
+    status: str = "submitted"
+    max_lead_time_days: int
+    expected_delivery: str
 
 # API endpoints
 @app.get("/")
@@ -303,6 +348,68 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations", response_model=List[RestockRecommendation])
+def get_restock_recommendations(budget: float = 25000.0):
+    recs: list[dict] = []
+    for d in demand_forecasts:
+        shortage = max(0, d["forecasted_demand"] - d["current_stock"])
+        line_cost = round(shortage * d["unit_cost"], 2)
+        recs.append({
+            "sku": d["item_sku"],
+            "item_name": d["item_name"],
+            "current_stock": d["current_stock"],
+            "forecasted_demand": d["forecasted_demand"],
+            "shortage": shortage,
+            "unit_cost": d["unit_cost"],
+            "recommended_qty": shortage,
+            "line_cost": line_cost,
+            "lead_time_days": d["lead_time_days"],
+            "trend": d["trend"],
+            "selected": False,
+        })
+
+    # Priority: items with rising demand first, then largest shortage —
+    # surfaces the most urgent restocks before budget runs out.
+    recs.sort(key=lambda r: (r["trend"] != "increasing", -r["shortage"]))
+
+    running = 0.0
+    for r in recs:
+        if r["shortage"] > 0 and running + r["line_cost"] <= budget:
+            r["selected"] = True
+            running += r["line_cost"]
+
+    return recs
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockOrder])
+def list_restock_orders():
+    return list(reversed(mock_data.restock_orders))
+
+
+@app.post("/api/restocking/orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(req: CreateRestockOrderRequest):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="At least one item is required")
+
+    total_cost = round(sum(i.line_cost for i in req.items), 2)
+    if total_cost > req.budget:
+        raise HTTPException(status_code=400, detail="Total cost exceeds budget")
+
+    max_lead = max(i.lead_time_days for i in req.items)
+    today = date.today()
+    order = RestockOrder(
+        id=f"RST-{len(mock_data.restock_orders) + 1:04d}",
+        submitted_at=today.isoformat(),
+        budget=req.budget,
+        total_cost=total_cost,
+        items=req.items,
+        max_lead_time_days=max_lead,
+        expected_delivery=(today + timedelta(days=max_lead)).isoformat(),
+    )
+    mock_data.restock_orders.append(order.model_dump())
+    return order
+
 
 if __name__ == "__main__":
     import uvicorn
